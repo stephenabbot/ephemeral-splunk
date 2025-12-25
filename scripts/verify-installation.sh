@@ -1,0 +1,198 @@
+#!/bin/bash
+# scripts/verify-installation.sh - Verify Splunk installation and infrastructure
+
+set -euo pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+print_status() { echo -e "${BLUE}[INFO]${NC} $1"; }
+print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Change to project root directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "$PROJECT_ROOT"
+
+# Disable AWS CLI pager
+export AWS_PAGER=""
+
+echo "🔍 VERIFYING EPHEMERAL SPLUNK INSTALLATION 🔍"
+echo ""
+
+# Check if infrastructure outputs exist
+if [ ! -f "infrastructure-outputs.json" ]; then
+    print_error "Infrastructure outputs not found. Run ./scripts/deploy.sh first"
+    exit 1
+fi
+
+# Get instance information
+INSTANCE_ID=$(jq -r '.instance_info.value.instance_id' infrastructure-outputs.json)
+LOG_GROUP=$(jq -r '.instance_info.value.log_group_name' infrastructure-outputs.json)
+
+if [ "$INSTANCE_ID" = "null" ] || [ -z "$INSTANCE_ID" ]; then
+    print_error "Could not get instance ID from outputs"
+    exit 1
+fi
+
+print_status "Checking infrastructure components..."
+
+# Check EC2 instance state
+print_status "Checking EC2 instance state..."
+INSTANCE_STATE=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "not-found")
+
+case "$INSTANCE_STATE" in
+    "running")
+        print_success "EC2 instance is running"
+        ;;
+    "pending")
+        print_warning "EC2 instance is still starting up"
+        ;;
+    "stopped"|"stopping")
+        print_warning "EC2 instance is stopped or stopping"
+        ;;
+    "not-found")
+        print_error "EC2 instance not found"
+        exit 1
+        ;;
+    *)
+        print_error "EC2 instance is in unexpected state: $INSTANCE_STATE"
+        exit 1
+        ;;
+esac
+
+# Check CloudWatch Log Group
+print_status "Checking CloudWatch Log Group..."
+if aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" --query 'logGroups[0].logGroupName' --output text > /dev/null 2>&1; then
+    print_success "CloudWatch Log Group exists: $LOG_GROUP"
+else
+    print_error "CloudWatch Log Group not found: $LOG_GROUP"
+fi
+
+# Check SNS topic
+print_status "Checking SNS topic..."
+SNS_TOPIC_ARN=$(jq -r '.instance_info.value.sns_topic_arn' infrastructure-outputs.json)
+if aws sns get-topic-attributes --topic-arn "$SNS_TOPIC_ARN" > /dev/null 2>&1; then
+    print_success "SNS topic exists for cost alarms"
+else
+    print_error "SNS topic not found: $SNS_TOPIC_ARN"
+fi
+
+# Only check Splunk if instance is running
+if [ "$INSTANCE_STATE" = "running" ]; then
+    print_status "Checking Splunk installation status..."
+    
+    # Check user data logs for installation status
+    print_status "Checking installation logs..."
+    
+    # Get recent log events
+    LOG_EVENTS=$(aws logs filter-log-events \
+        --log-group-name "$LOG_GROUP" \
+        --start-time $(($(date +%s) * 1000 - 3600000)) \
+        --query 'events[].message' \
+        --output text 2>/dev/null || echo "")
+    
+    if echo "$LOG_EVENTS" | grep -q "SPLUNK_INSTALLATION_COMPLETE"; then
+        print_success "Splunk installation completed successfully"
+    elif echo "$LOG_EVENTS" | grep -q "ERROR:"; then
+        print_error "Splunk installation encountered errors"
+        echo "Recent error logs:"
+        echo "$LOG_EVENTS" | grep "ERROR:" | tail -5
+    elif echo "$LOG_EVENTS" | grep -q "Installing Splunk"; then
+        print_warning "Splunk installation is in progress"
+    else
+        print_warning "Splunk installation status unclear - check logs manually"
+    fi
+    
+    # Check if Splunk process is running via SSM
+    print_status "Checking if Splunk service is running..."
+    
+    COMMAND_ID=$(aws ssm send-command \
+        --instance-ids "$INSTANCE_ID" \
+        --document-name "AWS-RunShellScript" \
+        --parameters 'commands=["pgrep -f splunkd > /dev/null && echo RUNNING || echo NOT_RUNNING"]' \
+        --query 'Command.CommandId' \
+        --output text 2>/dev/null || echo "")
+    
+    if [ -n "$COMMAND_ID" ]; then
+        # Wait a moment for command to execute
+        sleep 3
+        
+        COMMAND_OUTPUT=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query 'StandardOutputContent' \
+            --output text 2>/dev/null || echo "")
+        
+        if echo "$COMMAND_OUTPUT" | grep -q "RUNNING"; then
+            print_success "Splunk service is running"
+        else
+            print_warning "Splunk service is not running"
+        fi
+    else
+        print_warning "Could not check Splunk service status via SSM"
+    fi
+    
+    # Check if Splunk web interface is responding
+    print_status "Checking Splunk web interface..."
+    
+    INSTANCE_IP=$(jq -r '.instance_info.value.instance_ip' infrastructure-outputs.json)
+    
+    WEB_CHECK_COMMAND_ID=$(aws ssm send-command \
+        --instance-ids "$INSTANCE_ID" \
+        --document-name "AWS-RunShellScript" \
+        --parameters 'commands=["curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8000 || echo FAILED"]' \
+        --query 'Command.CommandId' \
+        --output text 2>/dev/null || echo "")
+    
+    if [ -n "$WEB_CHECK_COMMAND_ID" ]; then
+        sleep 3
+        
+        WEB_OUTPUT=$(aws ssm get-command-invocation \
+            --command-id "$WEB_CHECK_COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query 'StandardOutputContent' \
+            --output text 2>/dev/null || echo "")
+        
+        if echo "$WEB_OUTPUT" | grep -q "200"; then
+            print_success "Splunk web interface is responding on port 8000"
+        else
+            print_warning "Splunk web interface is not responding (may still be starting)"
+        fi
+    fi
+    
+else
+    print_warning "Skipping Splunk checks - instance is not running"
+fi
+
+echo ""
+echo "📋 VERIFICATION SUMMARY"
+echo ""
+echo "Infrastructure Status:"
+echo "  • Instance ID: $INSTANCE_ID"
+echo "  • Instance State: $INSTANCE_STATE"
+echo "  • Log Group: $LOG_GROUP"
+echo ""
+
+if [ "$INSTANCE_STATE" = "running" ]; then
+    echo "🔗 Connection Commands:"
+    echo "  • SSM Shell: $(jq -r '.connection_info.value.ssm_command' infrastructure-outputs.json)"
+    echo "  • Port Forward: $(jq -r '.connection_info.value.port_forward_command' infrastructure-outputs.json)"
+    echo "  • Splunk URL: $(jq -r '.connection_info.value.splunk_url' infrastructure-outputs.json)"
+    echo "  • Default Login: admin / changeme"
+    echo ""
+    echo "📊 Monitoring:"
+    echo "  • CloudWatch Logs: aws logs tail $LOG_GROUP --follow"
+    echo "  • Cost Alarms: Configured for \$5, \$10, \$20"
+else
+    echo "ℹ️  Instance is not running. Use ./scripts/start-instance.sh to start it."
+fi
+
+echo ""
+echo "✅ Verification complete"
